@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+bun.lockb
+bun.lock
+
+# Logs and runtime output
+*.log
+/tmp/
+
+# Local credentials and machine-specific config
+.env
+.env.*
+*.local
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
