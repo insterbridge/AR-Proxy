@@ -1,361 +1,424 @@
-# agentrouter-retry-proxy
+# AR-Proxy
 
-A retry hop for AgentRouter: it absorbs the rate-limit and transient failures
-AgentRouter reports in ways a plain HTTP client cannot see, and it serializes the
-oversized requests that cause them.
+A small local proxy that retries selected AgentRouter failures and limits how
+many large requests run at once. It is useful when an upstream reports a
+rate limit in an error body—or inside a successful-looking SSE response—rather
+than through a status your client knows to retry.
 
-```
-Anthropic harness  ─┐
-                    ├─▶ retry hop :15720 ─▶ AgentRouter
-OpenAI Responses   ─┘
-```
-
-The hop is transport-agnostic: it forwards whatever path it receives and applies
-the same retry policy to both wires. It can sit in front of AgentRouter
-directly, or behind an intermediate router (see
-[One deployment](#one-deployment-cc-switch--claude-code)).
-
-## Install
-
-Requires [Bun](https://bun.sh) (uses `Bun.serve`).
-
-```bash
-git clone <this repo> && cd agentrouter-retry-proxy
-bun proxy.ts --help          # no build step; proxy.ts runs directly
+```text
+client -> AR-Proxy (127.0.0.1:15720) -> upstream
 ```
 
-Run it:
+AR-Proxy forwards HTTP requests; it does not translate between the Anthropic
+Messages API and the OpenAI Responses API. Its **upstream** is simply the next
+server it forwards requests to: either AgentRouter itself or a local API bridge.
 
-```bash
-bun proxy.ts                                    # 127.0.0.1:15720 -> 127.0.0.1:15721
-bun proxy.ts --upstream https://agentrouter.org # or straight to the provider
-bun proxy.ts --big-ctx-tokens 0                 # disable the context gate
+[cc-switch](https://github.com/farion1231/cc-switch) is a separate desktop app that
+manages provider configuration and can translate between API formats through a
+local proxy. It is optional—you need it only for the bridged setup below, not
+for a direct connection to AgentRouter.
+
+## Getting started
+
+Install [Bun](https://bun.sh), then clone the repository. Use a current Bun
+release; AR-Proxy itself needs no build step or package installation.
+
+```sh
+git clone "https://github.com/insterbridge/AR-Proxy.git" AR-Proxy
+cd AR-Proxy
+bun proxy.ts --help
 ```
 
-Then point your harness's base URL at `http://127.0.0.1:15720`.
+Choose one of the following setups. In both, **your client connects to AR-Proxy
+on port 15720**. The `--upstream` option determines where AR-Proxy sends the
+request next; it does not set the client's base URL.
 
-`claude.sh` is an optional launcher for Claude Code that starts the hop if it is
-not already listening and rewrites `--settings` to route through it. If you do
-not use Claude Code, ignore it — `proxy.ts` is the whole tool.
+### Option 1: connect directly to AgentRouter
 
-## Why it exists
+Use this when your client already speaks an API that your AgentRouter model
+supports—for example, a Responses client using a model's Responses endpoint.
+No cc-switch installation or local bridge is needed.
 
-AgentRouter reports token-rate-limit exhaustion *inside* the response payload
-rather than as a retryable status. Two distinct shapes show up depending on the
-wire:
-
-- **Anthropic wire** (`/v1/messages`): an intermediate router such as cc-switch
-  converts the upstream error into `ProxyError::TransformError`, which surfaces
-  as HTTP **422 格式转换错误**. Its own failover loop classifies 422 as
-  `NonRetryable`, so the error reaches the client on the first attempt.
-- **Responses wire** (`/v1/responses`): the status line is **200**, and the
-  failure arrives as an SSE `event: error` frame. A status-only check sees
-  success.
-
-Measured against `gpt-6.1-sol` (10–14 requests each, plus live session logs),
-these failure modes show up:
-
-| upstream behaviour | status seen by client | retried? |
-|---|---|---|
-| SSE `error` / `rate_limit_exceeded`: “exceeded token rate limit” | 422 | yes |
-| SSE `error` / `too_many_requests`: “experiencing high demand … exceeds the maximum usage size” | 422 | yes |
-| stream aborted before any event (or `response.failed`) | 422 “Responses upstream **failed before output**” | yes |
-| connection could not be established | **502** `请求转发失败: 上游连接失败: error sending request` | yes |
-| AgentRouter reports itself down | **503** `Upstream service unavailable [trace_id=…]` | yes |
-| HTTP 200 whose SSE body opens with an error frame | **200** | yes |
-| 400 “different backend resource” (stale reasoning item) | **400** | yes — once, with the items stripped |
-| request shape rejected (orphan tool call, empty content, …) | **400** with a specific message | no — deterministic |
-
-The 422 “failed before output” case occurs roughly 1 in 10 requests, independent
-of rate-limit pressure, and carries no rate-limit wording — so it needs its own
-signals. It is safe to replay because the message says *before output*: no bytes
-reached the client.
-
-**Some 400s are retryable and some are not**, and the status alone cannot tell
-you which. A 400 saying the reasoning item was minted by a different backend
-resource is recoverable: the payload is at fault, not the conversation, so the
-hop strips the offending items and replays once (see
-[mechanism 3](#3-stale-reasoning-recovery-400-different-backend-resource)).
-
-The rest are genuinely deterministic. Measured against the live upstream, each
-carries a specific cause:
-
-```
-No tool output found for function call tu_1.
-No tool call found for function call output with call_id tu_missing.
-Missing required parameter: 'input[0].content'.
-One of 'input' or 'instructions' is required.
+```sh
+bun proxy.ts --upstream "https://agentrouter.org"
 ```
 
-Retrying those would loop forever — the body is identical every time and nothing
-in it is strippable — so they pass through. When a conversation accumulates one
-of these, the fix is to change the conversation (drop the dangling tool call) or
-restart it, not to retry.
+AR-Proxy listens on `http://127.0.0.1:15720` and forwards requests to AgentRouter.
+Your client supplies its AgentRouter credentials and selects the model.
 
-## Three mechanisms
+Claude Code speaks the Messages API. A direct connection from Claude Code is
+appropriate only if the chosen provider/model accepts that API. If the model
+requires Responses instead, use the bridged setup below; AR-Proxy does not
+perform that conversion itself.
 
-### 1. Retry
+### Option 2: put AR-Proxy in front of cc-switch
 
-- retries only the statuses in `--retry-status` (default 422, 429) **whose body
-  matches a rate-limit or transient-failure phrase** (`too_many_requests`,
-  `rate limit`, `token rate`, `quota exceeded`, `overloaded`, `failed before
-  output`, `experiencing high demand`, …);
-- a 422 whose body is a genuine format error passes through untouched, as does
-  every other status;
-- **502/503/504 are retried regardless of body wording**, because they mean the
-  gateway could not complete the call. The exception is a 5xx whose body carries
-  `invalid_request_error` / `rejected the request as invalid`: that is a
-  deterministic rejection, so it passes through on the first attempt;
-- **HTTP 200 with an SSE error frame is retried.** The hop buffers only the
-  stream prefix and checks for an `event: error` / `event: response.failed`
-  before forwarding. The error always precedes content, so nothing the client
-  would act on is lost. Disable with `--no-inspect-sse`;
-- exponential backoff with ±25% jitter, `--base-delay` → `--max-delay`, bounded
-  by `--max-attempts` and `--deadline`;
-- on streaming requests it answers `200 text/event-stream` immediately and emits
-  Anthropic `ping` events every `--keepalive` ms while waiting, so client
-  first-byte/idle timers never fire during backoff. The retried upstream stream
-  is then spliced in verbatim;
-- exhausted retries emit an `error` SSE event on streams, and return the last
-  upstream status/body **plus a `Retry-After`** on non-streaming requests so the
-  client's own loop waits instead of rescheduling at 0s.
+Use this when you want cc-switch to manage provider routing or API conversion.
+For example, cc-switch can translate Claude Code's Messages requests into
+Responses requests for an appropriately configured provider. AR-Proxy sits in
+front of cc-switch and handles retries; cc-switch forwards to AgentRouter.
 
-### 2. Prevention (the big-context gate)
+Set up the bridge before starting AR-Proxy:
 
-Detection is slow because AgentRouter queues the request before rejecting it:
-measured 3s when the bucket is idle but **100–180s once it is saturated**.
-Retrying therefore costs minutes. The limit is a *token* rate limit and context
-size is what drives it — measured TTFT for `gpt-6-astra`:
+1. [Install cc-switch](https://github.com/farion1231/cc-switch/releases) and keep
+   it running while using this setup.
+2. Configure the AgentRouter provider in cc-switch with the base URL
+   `https://agentrouter.org` and your provider credentials. Select the API format
+   required by your model. For Messages-to-Responses conversion, see cc-switch's
+   [Claude Code routing guide](https://github.com/farion1231/cc-switch/blob/main/docs/guides/claude-codex-routing-guide-en.md).
+3. Enable cc-switch's local proxy/routing mode and check its listening address
+   and port. This README uses **`http://127.0.0.1:15721`** because that is
+   AR-Proxy's default upstream. It is not a required or universal cc-switch
+   port: if your cc-switch instance listens elsewhere, use its actual URL.
+4. Start AR-Proxy with that local URL:
 
-| context | requests | avg TTFT |
-|---|---|---|
-| < 50k | 47 | 4.5s |
-| 50–100k | 44 | 10.6s |
-| > 100k | 32 | 48.1s |
-
-So requests whose estimated input exceeds `--big-ctx-tokens` (default 60000,
-~4 chars/token over the raw body) are serialized through a semaphore
-(`--big-ctx-concurrency`, default 1). Small requests — subagents, titles, cheap
-models — bypass the gate entirely and stay parallel.
-
-The gate is **global, not keyed per model**. The hop only sees the client's
-model name, and an intermediate router may rewrite it (`claude-fable-5` →
-`gpt-6-astra`), so keying on that name would hand two aliases of the same
-upstream bucket separate permits and silently disable the gate. Gating globally
-is slightly stricter than AgentRouter's per-model limit — the safe direction,
-since it can only reduce concurrent load.
-
-The permit is held until the response body has actually drained, not merely
-until headers arrive — fetch resolves on headers while the upstream keeps
-generating for tens of seconds afterwards.
-
-### 3. Stale-reasoning recovery (400 "different backend resource")
-
-AgentRouter multiplexes across Azure/OpenAI deployments. An intermediate router
-may round-trip each OpenAI reasoning item inside a thinking block's `signature`
-(prefixed `ccswitch-openai-reasoning-v1:`) so stateless tool loops stay lossless.
-When a conversation's earlier turns were served by resource A and a later turn
-lands on resource B, the upstream rejects the replay:
-
-```
-400 The requested item was created under a different Azure OpenAI resource.
-    Use the same resource that created the item to access it.
+```sh
+bun proxy.ts --upstream "http://127.0.0.1:15721"
 ```
 
-An intermediate router does not recover from this: its thinking rectifier
-matches `"invalid request"` (spaced) and never sees `invalid_request_error`
-(underscored), and its other patterns are about signature *validity*, not
-resource ownership.
+With cc-switch running at that address, `bun proxy.ts` without options is
+equivalent. Without a server listening there, the default command cannot reach
+an upstream—it does not install or start cc-switch for you.
 
-The failure is deterministic in the sense that a plain replay would fail
-identically — the offending items travel with the conversation, so resending the
-same body just reproduces the error. What makes it recoverable is that the
-*payload* can be changed: the hop strips every `ccswitch-openai-reasoning-v1:`
-carrier — whole `thinking` / `redacted_thinking` blocks plus stray `signature`
-fields — and replays **once**. Text and tool calls survive; only the model's
-private reasoning is lost, which is the only way forward since that reasoning is
-unreadable to anything but the resource that minted it.
+Keep the two local ports distinct:
 
-If the stripped replay also fails, the real 400 is passed through rather than
-looped (verified: exactly 2 upstream hits, never more). This is why the strip
-runs at most once per request: an unlimited strip-and-retry would spin forever
-against an error it cannot fix.
+| Address | Role in this setup |
+| --- | --- |
+| `http://127.0.0.1:15720` | AR-Proxy; the address your client connects to |
+| `http://127.0.0.1:15721` | cc-switch's local listener; AR-Proxy forwards here |
+| `https://agentrouter.org` | Remote provider; cc-switch forwards here |
 
-## Two upstreams
+Pointing your client directly at `15721` skips AR-Proxy and its retries.
+cc-switch may set that client URL when managing configuration, so use the
+[Claude Code launcher](#optional-claude-code-launcher) below to route a new
+Claude Code session through `15720` without editing its global settings.
 
-`/v1/messages` and `/v1/responses` can target different upstreams, because an
-intermediate router usually speaks only one wire:
+Follow cc-switch's client/authentication configuration for the bridged route,
+and keep the client's configured model alias. cc-switch's provider settings
+determine the upstream model. Its
+[manual](https://github.com/farion1231/cc-switch/blob/main/docs/user-manual/en/README.md)
+has the full setup instructions.
 
-```bash
-bun proxy.ts --responses-upstream https://agentrouter.org
+### Using both routes at once
+
+If you want Messages traffic to use cc-switch but Responses traffic to go
+directly to AgentRouter, configure both destinations:
+
+```sh
+bun proxy.ts --upstream "http://127.0.0.1:15721" --responses-upstream "https://agentrouter.org"
 ```
 
-With that flag, `/v1/responses` requests go straight to AgentRouter while
-everything else keeps flowing through `--upstream`. Retry policy is identical on
-both, which is the point: AgentRouter's Responses wire is where token limits are
-reported as 200-plus-error-frame, so routing it through the hop is what makes
-those retries possible.
+cc-switch must still be configured and running for the bridged traffic.
+`--responses-upstream` applies to `/v1/responses` and `/v1/responses/...`, including
+requests with query parameters. Other paths use `--upstream`. A direct Responses
+client must supply its AgentRouter credentials; the proxy does not replace a
+bridge's local credentials with provider credentials.
 
-## Responses-API harnesses (Codex and others)
+### Client URLs and request paths
 
-Any harness that speaks the OpenAI Responses API can use the hop. Point its base
-URL at the hop and let `--responses-upstream` reach AgentRouter:
+A Messages client typically takes `http://127.0.0.1:15720`; a Responses client
+may expect `http://127.0.0.1:15720/v1`. Check the actual request path your client
+sends. Neither client should target cc-switch's port if it needs AR-Proxy's
+retry behavior.
 
-```bash
-bun proxy.ts --responses-upstream https://agentrouter.org
+The proxy appends the incoming path and query to the selected upstream base.
+For example, `--responses-upstream https://agentrouter.org` forwards a request
+to `/v1/responses` to `https://agentrouter.org/v1/responses`. A base can include a
+path prefix if your upstream requires one. Do not add `/v1` to the upstream base
+if the client's request path already includes it.
+
+AR-Proxy has no default model, does not replace the model in your request, and
+does not store API keys or grant provider access. Check the provider's current
+documentation for available models and supported APIs; this repository does not
+maintain a compatibility matrix or a client allowlist.
+
+Redirects that stay on the configured upstream route are rewritten to AR-Proxy
+URLs, so a client following them still passes through the retry layer and keeps
+its authentication headers. Redirects to another origin, outside the upstream
+base path, or onto a different configured route are rejected with HTTP `502`
+rather than sending the client around the proxy.
+
+Supported compressed responses are decoded before inspection, and only then is
+`Content-Encoding` removed. Unsupported encodings and their bytes are forwarded
+unchanged. HEAD responses retain their representation length and encoding.
+Inspected HTTP error bodies are retained as bytes rather than decoded and
+re-encoded. Synthetic retry streams retain the initial failure's CORS and other
+end-to-end headers, but replace metadata for the newly generated stream.
+
+## Optional Claude Code launcher
+
+The proxy can run on its own. If you use Claude Code, `claude.ts` also handles
+starting AR-Proxy and routing the launch through it. **By default, the launcher
+uses the cc-switch setup above**, so cc-switch must already be configured and
+listening on `http://127.0.0.1:15721`. The launcher does not start that bridge.
+
+```sh
+bun claude.ts
+bun claude.ts --settings "${HOME}/.claude/settings.json"
 ```
 
-```
-harness base URL:  http://127.0.0.1:15720/v1
-wire:              OpenAI Responses  (POST /v1/responses)
-```
+The second command reads the usual global Claude Code settings file from your
+home directory; it does not modify that file.
 
-The hop forwards the path unchanged and applies the same retry, backoff, and
-context gate as on the Anthropic wire. Nothing about the request body is
-rewritten, so a harness sees AgentRouter's SSE events exactly as emitted —
-including the 200-plus-error-frame limit reports, which the hop retries before
-the harness ever sees them.
+On systems with Bash, `./claude.sh` is a shortcut for the same launcher. On
+Windows, use `bun claude.ts` and the native Claude Code executable, rather than
+a `.cmd` or `.bat` shim.
 
-This matters for Responses harnesses specifically: because the failure arrives
-under a 200 status, a harness that checks `response.ok` alone will treat an
-exhausted rate limit as a successful empty turn.
+The launcher:
 
-## Client allowlist (401 unauthorized client detected)
+- checks whether the chosen port is already running AR-Proxy;
+- starts a detached proxy if the port is free, then waits for its health check;
+- copies a supplied `--settings` file or inline JSON value, changes
+  `env.ANTHROPIC_BASE_URL` in that copy, and passes a private temporary settings
+  file to Claude Code;
+- leaves the original settings file and `~/.claude/settings.json` untouched,
+  and removes its temporary copy when the CLI exits or startup fails;
+- returns the Claude Code process's exit code on a normal exit and forwards
+  catchable interrupt/termination signals to it.
 
-AgentRouter gates access on a client allowlist and keys it on the **User-Agent**
-header. Requests from an unrecognized client are rejected before the endpoint
-matters:
+Without `--settings`, it reads `~/.claude/retry-proxy.json` if that file exists,
+otherwise it creates a temporary overlay. No overlay file needs to be created
+by hand. Invalid JSON or an invalid `env` block stops the launch with an error
+instead of silently launching without retries.
 
-```
-401 {"error":{"message":"unauthorized client detected, contact support for
-     assistance at https://discord.gg/HgekCyHJqB"},"message":"UNAUTHENTICATED",
-     "success":false,"type":"unauthorized_client_error"}
-```
+The launcher **does not start cc-switch** or configure an upstream provider.
+Start your bridge separately, or set `AGENTROUTER_RETRY_UPSTREAM`. It also does
+not replace your `claude` command automatically. If you put your own wrapper on
+`PATH`, set `AGENTROUTER_RETRY_CLAUDE` to the real executable to avoid recursion.
 
-This is not a proxy bug and not a bad key: the same token works from a client on
-the list. It applies to every route — `/v1/models`, `/v1/chat/completions`,
-`/v1/messages`, `/v1/responses` — and cannot be bypassed with another header
-(`x-client-name`, `x-app`, `x-title`, `?client=` are all ignored). An
-intermediate router forwards the client's `User-Agent` verbatim, so putting one
-in the chain does not change the outcome.
+Terminal Ctrl+C reaches the CLI through its foreground process group; the
+launcher does not send a second interrupt or force the CLI to exit if it handles
+that interrupt and stays open. Where the OS supports catchable signals, SIGTERM
+and non-terminal SIGINT are forwarded, with up to five seconds for cleanup. Use
+SIGTERM for programmatic graceful termination of an interactive launcher.
+Unexpected or forced termination may leave the private settings copy behind;
+force-killing the launcher cannot be intercepted. Use your OS's
+process-management facilities when
+terminating a whole process tree.
 
-If you hit this, set the `User-Agent` header your harness sends to one of the
-clients AgentRouter documents as supported — their docs list the current set.
-Most harnesses expose this through provider-level headers, so it is usually
-configuration rather than a code change.
+The temporary file keeps settings credentials and large configurations out of
+the child's command line. For secret-bearing input, prefer file-backed
+`--settings`: inline JSON is still present in the original command you run. Temporary copies
+are owner-only on POSIX systems; on Windows, use your private user temporary
+directory rather than a shared location.
 
-Two caveats. AgentRouter documents some clients that its allowlist does not
-currently accept, so a page existing is not proof the client passes — verify
-with a single request before relying on it. And deliberately impersonating a
-client you are not is a policy question, not a technical one; the sustainable
-fix is asking AgentRouter to allowlist your harness.
+A detached proxy stays running after Claude Code exits. Reusing one does not
+change its upstream or gate settings: restart it, or choose another port, when
+changing those settings. An older proxy without the health endpoint is rejected
+rather than mistaken for a compatible instance.
 
-The hop does not touch `User-Agent` and never rewrites it — whatever the harness
-sends is what reaches AgentRouter.
+### Launcher environment variables
 
-## Logging
+These variables configure `claude.ts`, not a separately started `proxy.ts`:
 
-Lines go to stdout and, with `--mirror-log <path>`, are also appended to that
-file **in cc-switch's log format** so hop activity sits inline with a router's
-own output:
+| Variable | Default / purpose |
+| --- | --- |
+| `AGENTROUTER_RETRY_PORT` | `15720` |
+| `AGENTROUTER_RETRY_UPSTREAM` | `http://127.0.0.1:15721`; the cc-switch listener in the default bridged setup |
+| `AGENTROUTER_RETRY_RESPONSES_UPSTREAM` | Unset; optional Responses upstream |
+| `AGENTROUTER_RETRY_BIG_CTX_TOKENS` | `60000`; `0` disables the gate |
+| `AGENTROUTER_RETRY_BIG_CTX_CONCURRENCY` | `1` |
+| `AGENTROUTER_RETRY_LOG` | `AR-Proxy-15720.log` in the OS temporary directory by default; the filename follows the configured port |
+| `AGENTROUTER_RETRY_MIRROR` | Unset; optional additional log file |
+| `AGENTROUTER_RETRY_SETTINGS` | Optional overlay input, used when there is no `--settings`; an explicitly configured file must exist |
+| `AGENTROUTER_RETRY_CLAUDE` | Claude Code executable found on `PATH`; can be an explicit executable path |
 
-```
-[2026-09-30][20:29:25][INFO][agentrouter-retry-proxy] [POST /v1/messages?beta=true] attempt 1 -> 200 in 4.7s ctx=~12k passthrough
-```
+To select the direct AgentRouter route instead, set the upstream override
+below. For Claude Code, use this only when your provider/model supports the
+Messages API; otherwise keep the cc-switch route.
 
-Each line carries `ctx=~Nk` (estimated input tokens), `queue=Xs` when the gate
-made it wait, and attempt timings — enough to see *why* a turn was slow.
+In Bash or zsh:
 
-## One deployment: cc-switch + Claude Code
-
-This is the setup the project was built for. It is one valid arrangement, not a
-requirement — the hop works standalone.
-
-```
-Claude Code ──▶ retry hop :15720 ──▶ cc-switch :15721 ──▶ AgentRouter /v1/responses
-```
-
-Claude Code speaks the Anthropic Messages API; AgentRouter serves some models
-only through the Responses API. cc-switch bridges the two, and the hop absorbs
-the failures cc-switch classifies as non-retryable.
-
-Claude Code's `~/.claude/settings.json` `env` block overrides the process
-environment, and cc-switch rewrites that block whenever it attaches the proxy.
-Do not edit `settings.json` by hand. `claude.sh` covers both launch shapes:
-
-- **no `--settings`** → appends `~/.claude/retry-proxy.json`, which wins over
-  `settings.json`.
-- **`--settings <file-or-json>`** → rewrites `ANTHROPIC_BASE_URL` inside that
-  value. This is what cc-switch's "launch in terminal" button needs: it runs
-  `claude --settings <cc-switch temp config>` pointing at its own port, and a
-  second `--settings` cannot override it (the later flag wins, and cc-switch's
-  comes last). A non-JSON value launches unchanged with a warning.
-
-### Surviving a cc-switch exit
-
-cc-switch has no headless mode. When it quits it rewrites `settings.json` to a
-direct upstream URL but leaves `~/.cc-switch/live-state.json` declaring
-`"mode": "proxy"`. Launching against that stale direct URL skips the router
-*and* the hop, and AgentRouter's Anthropic-compat endpoint then routes
-non-Anthropic models through `/v1/chat/completions`:
-
-```
-400 Function tools with reasoning_effort are not supported for gpt-6.1-sol
-    in /v1/chat/completions. To use function tools, use /v1/responses
+```sh
+AGENTROUTER_RETRY_UPSTREAM="https://agentrouter.org" bun claude.ts
 ```
 
-(`gpt-6.1-sol` advertises `supported_endpoint_types: ["openai"]`; cc-switch is
-what knows to reach it via `/v1/responses`.)
+In PowerShell:
 
-The optional `~/.local/bin/claude` wrapper handles this: it reads
-`live-state.json` before deciding. Proxy intent + a remote base means the direct
-URL is merely stale, so it starts cc-switch, waits for the router, and re-reads
-`settings.json` — which cc-switch rewrites back to port 15721 — before handing
-off to the hop. An explicit `--settings` is exempt, and `"mode": "direct"` still
-goes straight to the real binary.
-
-Sessions started before the hop existed keep talking to cc-switch directly (a
-running Claude process resolves its settings once at startup and never re-reads
-them) — restart them to get retries.
-
-Environment overrides: `AGENTROUTER_RETRY_PORT`, `AGENTROUTER_RETRY_LOG`,
-`AGENTROUTER_RETRY_SETTINGS`, `AGENTROUTER_RETRY_MIRROR`,
-`AGENTROUTER_RETRY_BIG_CTX_TOKENS`, `AGENTROUTER_RETRY_BIG_CTX_CONCURRENCY`,
-`AGENTROUTER_RETRY_RESPONSES_UPSTREAM`.
-
-## Test
-
-```bash
-./smoke.sh    # spins up probe-server.ts as a fake upstream, 18 checks
+```powershell
+$env:AGENTROUTER_RETRY_UPSTREAM = "https://agentrouter.org"
+bun claude.ts
 ```
 
-`probe-server.ts` is the fixture: `/ok`, `/flaky422` (fails twice then
-recovers), `/rate422` (always rate-limited), `/beforeoutput` (always “failed
-before output”), `/flakybefore` (fails once with it, then recovers),
-`/highdemand` (always peak-load rejection), `/connfail` (always 502),
-`/flakyconn` (502 twice then recovers), `/unavail503`, `/reject502` (a 502 that
-must not be retried), `/sse200limit` (HTTP 200 carrying an error frame),
-`/flakysse200` (fails once that way, then streams a healthy response),
-`/fmt422` (genuine format error), `/slow75`.
+## Retry behavior
 
-## Prior art
+Retry decisions use both the status and the response body:
 
-Surveyed existing AgentRouter proxies before building this. Observations that
-shaped the design:
+| Response | Behavior |
+| --- | --- |
+| `422` or `429` with recognized rate-limit or transient-failure wording | Retry with backoff |
+| `502`, `503`, or `504` | Retry, unless the body identifies a deterministic invalid request |
+| Connection failure or upstream timeout, including the first attempt | Retry within the attempt and time budgets |
+| HTTP `200` SSE with an early `error` or `response.failed` frame containing recognized wording | Retry before forwarding the buffered prefix |
+| `400` identifying a backend-resource mismatch, with removable cc-switch reasoning carriers in the request | Remove those carriers and retry once |
+| Other errors | Pass through |
 
-- No surveyed project retries the 422 by matching rate-limit wording in the body;
-  most ignore 422 or refuse to retry any 4xx.
-- None detect the token-rate condition earlier than the full response; the
-  100–180s latency is upstream-side. This is why the prevention gate exists.
-- Mechanisms that reduce *hitting* the limit are local rate limiting + queueing
-  (RPM limiters, pre-emptive checks with a bounded queue), which is the shape the
-  big-context gate follows.
-- The `Retry-After` injection on exhaustion follows the approach of the more
-  mature proxies in this space.
-- Deliberately not implemented: prompt mutation to evade the provider's WAF
-  (corrupts code and circumvents provider controls), and runtime self-update
-  from GitHub (an unpinned remote-code channel).
+Recognized wording includes `too_many_requests`, `rate limit`, `quota exceeded`,
+`overloaded`, `failed before output`, `experiencing high demand`, and
+`Upstream service unavailable`. The last phrase is recognized even when a bridge
+wraps it in a `422` or a provider sends it in an early HTTP `200` SSE error.
+A `422` format error—or even a `429` without a recognized signal—is not retried by
+this body-matching policy. A body containing `invalid_request_error` or
+`rejected the request as invalid` takes precedence over rate-limit wording.
+
+Backoff is exponential with ±25% jitter, capped by `--max-delay`. An upstream
+`Retry-After` header, expressed as seconds or an HTTP date, sets a minimum wait
+and can exceed that cap. The request's deadline still applies.
+
+`--max-attempts` counts **all** upstream calls, including the original call and
+any stale-reasoning recovery. The retry deadline starts after the request body
+has been read and covers the gate queue, upstream attempts, and backoff. Once a
+healthy response is accepted, its body may stream past that deadline; the
+separate per-call upstream timeout still applies.
+
+### Streaming details
+
+SSE inspection reads complete frames in order, up to a 64 KiB prefix. It skips
+known preamble events and stops at output or an unfamiliar data event. Buffered
+bytes and the remaining stream are then forwarded without rewriting them.
+Errors arriving **after output has started are not retried**, even if they share
+a network chunk with earlier content. Use `--no-inspect-sse` to disable inspection.
+
+For a JSON request with `"stream": true`, a retryable failure starts an HTTP
+`200 text/event-stream` response while the proxy retries. During that wait,
+Messages requests get `ping` events; Responses, Chat Completions, and other
+streaming routes get SSE comments. Keepalives remain active while a final HTTP
+error body is read, within the retry deadline. They stop before recovered
+upstream bytes are forwarded, so they cannot be inserted into partial frames.
+
+Keepalives are **not** sent during the initial upstream attempt or while waiting
+for the large-request gate. They help during retry backoff, but do not guarantee
+that every client's first-byte or idle timeout will be avoided.
+
+If retries are exhausted:
+
+- non-streaming requests receive the last error body and headers, with a
+  `Retry-After` header added if absent;
+- an error hidden under HTTP `200` becomes HTTP `502` for a non-streaming request,
+  with the buffered SSE error body retained;
+- requests whose streaming headers have already been sent receive an `error`
+  SSE event in the Messages or Responses envelope, or a data-only error object
+  for Chat Completions, since the status can no longer change. Unknown streaming
+  routes receive a generic SSE error. This also applies to a later,
+  non-retryable HTTP error or redirect. The proxy extracts the upstream error
+  message and preserves recognized error types/codes instead of displaying a
+  buffered lifecycle preamble.
+
+Retries are bounded, not a guarantee of success. With a remote provider, the
+proxy cannot prove that an interrupted request did no work or incurred no cost.
+Use it for request types you are comfortable replaying.
+
+### Large-request gate
+
+The proxy estimates input size as roughly one token per four characters of the
+raw request body. This is not a model tokenizer, a provider TPM limit, or an
+accurate estimate for images and other encoded data.
+
+Requests at or above `--big-ctx-tokens` share a FIFO gate, with
+`--big-ctx-concurrency` permits. The gate is global because different client
+model names may map to the same upstream resource. Smaller requests bypass it.
+
+A permit stays held through retries and until the response body drains or is
+cancelled—not just until headers arrive. Disconnected and expired requests leave
+the queue. Set `--big-ctx-tokens 0` to disable this behavior.
+
+### Stale-reasoning recovery
+
+The special `400` recovery handles cc-switch carriers beginning with
+`ccswitch-openai-reasoning-`. It removes matching `thinking` and
+`redacted_thinking` blocks from a Messages request, plus matching stray
+`signature` fields. Other text, tool blocks, and native signatures are retained.
+
+This deliberately changes the request and discards the carried reasoning. It
+runs at most once, only after a recognized resource-mismatch error. If the
+changed request is also rejected, that rejection is returned rather than
+looped. Numeric values in retained tool inputs are preserved from their JSON
+source, including large integers and precise decimals. If the Bun runtime cannot
+preserve those values, recovery is skipped rather than changing them. Native
+Responses `input` items are **not** rewritten by this mechanism.
+
+## Proxy options
+
+All numeric values must be integers. Time values are in milliseconds.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--listen` | `127.0.0.1` | Bind address |
+| `--port` | `15720` | Bind port, `1–65535` |
+| `--upstream` | `http://127.0.0.1:15721` | Next server: the local cc-switch listener by default, or AgentRouter for a direct connection |
+| `--responses-upstream` | Unset | Separate upstream for Responses paths |
+| `--max-attempts` | `8` | Total upstream calls per request |
+| `--base-delay` | `2000` | Initial backoff |
+| `--max-delay` | `30000` | Backoff cap after jitter, excluding `Retry-After` |
+| `--deadline` | `300000` | Queue and retry time budget |
+| `--upstream-timeout` | `600000` | Timeout for each upstream call, including its body |
+| `--keepalive` | `10000` | Keepalive interval during streaming retries; `0` disables |
+| `--retry-status` | `422,429` | Body-matched error statuses; does not disable the separate `502/503/504` policy |
+| `--big-ctx-tokens` | `60000` | Gate threshold; `0` disables |
+| `--big-ctx-concurrency` | `1` | Large requests allowed at once |
+| `--mirror-log` | Unset | Additional log file; its parent directory must exist |
+| `--inspect-sse` / `--no-inspect-sse` | Enabled | Early SSE error inspection |
+| `-h`, `--help` | — | Show command-line help |
+
+Upstream URLs must be absolute HTTP or HTTPS URLs without embedded credentials,
+query parameters, or fragments. Authentication belongs in client headers.
+
+## Logging and local access
+
+The standalone proxy writes timestamped lines to stdout. `--mirror-log` also
+appends them in a cc-switch-style format; it does not require cc-switch, and a
+mirror-file error is reported without stopping the proxy. The launcher redirects
+proxy output to its log file in the OS temporary directory unless configured
+otherwise. New launcher logs are owner-only on POSIX systems. Existing logs
+must belong to the current user and have no group/other permissions; links and
+non-regular files are rejected rather than followed. Use a private log location
+on Windows as well.
+
+Logs include request paths, approximate context size, queue notices, retries,
+and short upstream errors. Treat logs as private: paths, queries, and upstream
+error text may contain sensitive information.
+
+`GET /__ar_proxy/health` is a local health endpoint returning the service name
+and process ID. It is the one reserved route that is not forwarded upstream.
+You can use the process ID to stop a detached instance with your OS's process
+manager. A foreground instance can be stopped with Ctrl+C.
+
+The default listener is loopback-only. There is no built-in authentication,
+TLS termination, persistent queue, or general request-rate limiter. Do not expose
+it to an untrusted network without a separate authenticated boundary. Provided
+client headers, including `User-Agent`, are forwarded apart from hop-by-hop
+headers. The proxy does not impersonate an approved client or resolve provider
+access-policy failures.
+
+## Tests and portability
+
+```sh
+bun test
+```
+
+The suite uses local fixtures, dynamically assigned ports, and OS-provided
+temporary directories. It covers retry classification, SSE framing, deadlines,
+request cancellation, the gate, reasoning recovery, and launcher settings.
+It makes no live provider calls and needs no API keys, curl, jq, or Python.
+`./smoke.sh` runs the same suite if Bash is available.
+
+For manual experiments, the fixture can also run separately:
+
+```sh
+bun probe-server.ts --port 15722
+bun proxy.ts --upstream "http://127.0.0.1:15722/flaky422"
+```
+
+Other fixture prefixes include `/ok`, `/rate422`, `/fmt422`, `/fmt400`,
+`/flakybefore`, `/flakyconn`, `/unavail503`, `/reject502`, `/sse200limit`,
+`/flakysse200`, and `/azurealways`. They are synthetic test cases, not a claim
+about a provider's current behavior.
+
+The proxy, launcher, and tests use Bun and platform-neutral path/process APIs.
+The Bash scripts are optional compatibility entry points. A CI matrix is
+included for Linux, macOS, and Windows; live-provider behavior still needs to be
+checked in your own authorized setup.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
