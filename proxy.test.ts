@@ -188,6 +188,26 @@ describe("HTTP forwarding", () => {
     expect(await (await fetch(new URL("/v1/responses-other", server.url))).text()).toBe("primary");
     expect(await (await fetch(new URL("/v1/messages", server.url))).text()).toBe("primary");
   });
+
+  test("routes model discovery to the second upstream so it answers on its own wire", async () => {
+    const first = upstream(() => new Response("primary"));
+    const second = upstream((req) => new Response(new URL(req.url).pathname));
+    const server = proxy(first.url.toString(), { responsesUpstream: second.url.toString() });
+    // A client discovering models should see the upstream that actually serves the
+    // models it will call, not whichever wire the default upstream happens to speak.
+    expect(await (await fetch(new URL("/v1/models", server.url))).text()).toBe("/v1/models");
+    expect(await (await fetch(new URL("/v1/models?x=1", server.url))).text()).toBe("/v1/models");
+    expect(await (await fetch(new URL("/api/pricing", server.url))).text()).toBe("/api/pricing");
+    // Unrelated paths keep going to the default upstream.
+    expect(await (await fetch(new URL("/v1/models-other", server.url))).text()).toBe("primary");
+    expect(await (await fetch(new URL("/api/other", server.url))).text()).toBe("primary");
+  });
+
+  test("keeps model discovery on the default upstream when no second upstream is set", async () => {
+    const first = upstream((req) => new Response(new URL(req.url).pathname));
+    const server = proxy(first.url.toString());
+    expect(await (await fetch(new URL("/v1/models", server.url))).text()).toBe("/v1/models");
+  });
 });
 
 describe("retry policy", () => {

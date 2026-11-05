@@ -48,7 +48,8 @@ Options:
   --port <n>                  listen port                     (default 15720)
   --listen <addr>             listen address                  (default 127.0.0.1)
   --upstream <url>            upstream base URL               (default http://127.0.0.1:15721)
-  --responses-upstream <url>  separate upstream for /v1/responses and its subpaths
+  --responses-upstream <url>  separate upstream for /v1/responses and its subpaths,
+                              plus model discovery (/v1/models, /api/pricing)
   --max-attempts <n>          total tries, including recovery (default 8)
   --base-delay <ms>           initial backoff delay           (default 2000)
   --max-delay <ms>            backoff ceiling, after jitter   (default 30000)
@@ -469,7 +470,17 @@ type RequestState = {
 };
 
 function upstreamBase(opts: Options, path: string): string {
-  return opts.responsesUpstream && isResponsesPath(path) ? opts.responsesUpstream : opts.upstream;
+  if (!opts.responsesUpstream) return opts.upstream;
+  if (isResponsesPath(path)) return opts.responsesUpstream;
+  const pathname = path.split("?", 1)[0];
+  // The model catalog lives next to Responses on these providers. /v1/models and
+  // AgentRouter's public /api/pricing carry no request body, and pairing them with
+  // the Responses upstream keeps client-side model discovery working through the
+  // hop instead of failing on whichever wire the default upstream speaks.
+  if (pathname === "/v1/models" || pathname.startsWith("/v1/models/") || pathname === "/api/pricing") {
+    return opts.responsesUpstream;
+  }
+  return opts.upstream;
 }
 
 async function routeRedirect(response: Response, state: RequestState, base: string): Promise<Response> {

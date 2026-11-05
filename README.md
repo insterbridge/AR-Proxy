@@ -110,9 +110,25 @@ bun proxy.ts --upstream "http://127.0.0.1:15721" --responses-upstream "https://a
 
 cc-switch must still be configured and running for the bridged traffic.
 `--responses-upstream` applies to `/v1/responses` and `/v1/responses/...`, including
-requests with query parameters. Other paths use `--upstream`. A direct Responses
+requests with query parameters, and to the model-discovery paths `/v1/models`,
+`/v1/models/...`, and `/api/pricing`. Other paths use `--upstream`. Discovery
+follows the Responses upstream because that is the wire the models you are about
+to call actually speak; sending `GET /v1/models` to a bridge that only handles
+Messages answers nothing useful, and on a stopped bridge it stalls until the
+retry budget runs out. A direct Responses
 client must supply its AgentRouter credentials; the proxy does not replace a
 bridge's local credentials with provider credentials.
+
+AgentRouter also exposes a public, unauthenticated catalog at
+`https://agentrouter.org/api/pricing`, which lists each model's
+`supported_endpoint_types` and the quota `enable_groups` it is offered to. It is
+forwarded by the same rule, so a client can read it through the hop:
+
+```sh
+curl -sSL http://127.0.0.1:15720/api/pricing
+```
+
+Neither catalog is cached or rewritten — both are forwarded as received.
 
 ### Client URLs and request paths
 
