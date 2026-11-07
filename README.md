@@ -362,11 +362,12 @@ replaces the newest `--drop-images` image blocks (default `10`) with a short
 text note and retries. If the provider still reports the cap, it drops another
 batch, bounded by `--max-attempts`.
 
-It recognizes `input_image` blocks in a Responses `input`, and `image` /
-`image_url` blocks in a `messages` array, so bridged Messages and Chat-Completions
-requests are trimmed the same way. The oldest images are kept and the most recent
-ones go first, on the assumption that the newest screenshots are the least
-important context. `--drop-images 0` disables the behavior.
+It recognizes `input_image`, `image_url`, and `image` blocks anywhere in the
+body, including where real sessions actually carry them: inside a Claude Code
+`tool_result.content` array, or a Responses tool output. The oldest images are
+kept and the most recent ones go first, on the assumption that the newest
+screenshots are the least important context. `--drop-images 0` disables the
+behavior.
 
 Two limits are deliberate: the last image is never dropped — a request that
 arrives with a single image is returned with the provider's error rather than

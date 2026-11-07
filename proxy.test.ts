@@ -222,34 +222,24 @@ describe("image cap", () => {
     messages: [{ role: "user", content: [{ type: "text", text: "look" }, ...images(count, "image_url")] }],
   });
 
-  function contentBlocks(body: unknown): unknown[] {
-    if (!body || typeof body !== "object") return [];
-    const blocks: unknown[] = [];
-    const lists = [
-      "input" in body ? body.input : undefined,
-      "messages" in body ? body.messages : undefined,
-    ];
-    for (const list of lists) {
-      if (!Array.isArray(list)) continue;
-      for (const item of list) {
-        if (!item || typeof item !== "object" || !("content" in item)) continue;
-        if (Array.isArray(item.content)) blocks.push(...item.content);
-      }
-    }
-    return blocks;
-  }
-
   function imageUrls(body: unknown): string[] {
-    return contentBlocks(body).flatMap((block) => {
-      if (!block || typeof block !== "object" || !("type" in block)) return [];
-      if (block.type !== "input_image" && block.type !== "image_url") return [];
-      if (!("image_url" in block)) return [];
-      if (typeof block.image_url === "string") return [block.image_url];
-      if (block.image_url && typeof block.image_url === "object" && "url" in block.image_url && typeof block.image_url.url === "string") {
-        return [block.image_url.url];
+    const urls: string[] = [];
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        for (const item of value) walk(item);
+        return;
       }
-      return [];
-    });
+      if (!value || typeof value !== "object") return;
+      if ("type" in value && (value.type === "input_image" || value.type === "image_url") && "image_url" in value) {
+        if (typeof value.image_url === "string") urls.push(value.image_url);
+        else if (value.image_url && typeof value.image_url === "object" && "url" in value.image_url && typeof value.image_url.url === "string") {
+          urls.push(value.image_url.url);
+        }
+      }
+      for (const child of Object.values(value)) walk(child);
+    };
+    walk(body);
+    return urls;
   }
 
   test("drops the newest images and retries while the provider reports its cap", async () => {
@@ -283,6 +273,37 @@ describe("image cap", () => {
     const response = await post(server, chatBody(5), "/v1/chat/completions");
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
+  });
+
+  test("finds images nested in tool results", async () => {
+    const seen: string[][] = [];
+    const target = upstream(async (req) => {
+      const body: unknown = await req.json();
+      seen.push(imageUrls(body));
+      if (imageUrls(body).length > 4) {
+        return Response.json({ error: { message: "Exceeded maximum number of images (4) allowed in the request." } }, { status: 400 });
+      }
+      return Response.json({ ok: true });
+    });
+    const server = proxy(target.url.toString(), { dropImages: 3, maxAttempts: 4 });
+    // Claude Code returns screenshots inside a tool_result content array, and
+    // Responses tool outputs carry them the same way one level deeper.
+    const body = {
+      model: "probe-model",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "start" }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "screenshot", input: {} }] },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "t1", content: [
+            { type: "text", text: "captured" },
+            ...images(8),
+          ] },
+        ] },
+      ],
+    };
+    const response = await post(server, body, "/v1/messages");
+    expect(response.status).toBe(200);
+    expect(seen.map((urls) => urls.length)).toEqual([8, 5, 2]);
   });
 
   test("passes the provider error through instead of dropping the last image", async () => {

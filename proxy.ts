@@ -421,7 +421,7 @@ type ImageTrim = { body: string; removed: number; total: number };
  */
 function dropTrailingImages(body: Uint8Array | undefined, count: number): ImageTrim | null {
   if (!body || count <= 0) return null;
-  let parsed: { input?: unknown; messages?: unknown };
+  let parsed: unknown;
   let lossless = true;
   const rawJSON = (JSON as typeof JSON & { rawJSON?: (text: string) => unknown }).rawJSON;
   try {
@@ -437,26 +437,35 @@ function dropTrailingImages(body: Uint8Array | undefined, count: number): ImageT
     return null;
   }
   if (!lossless || !parsed || typeof parsed !== "object") return null;
-  const slots: Array<{ content: unknown[]; index: number; type: string }> = [];
-  for (const list of [parsed.input, parsed.messages]) {
-    if (!Array.isArray(list)) continue;
-    for (const item of list) {
-      if (!item || typeof item !== "object" || !("content" in item)) continue;
-      const content = item.content;
-      if (!Array.isArray(content)) continue;
-      content.forEach((block, index) => {
-        if (!block || typeof block !== "object" || !("type" in block)) return;
-        if (typeof block.type !== "string" || !Object.hasOwn(IMAGE_BLOCK_TYPES, block.type)) return;
-        slots.push({ content, index, type: block.type });
+  // Images nest to arbitrary depth: a Claude Code tool result carries them at
+  // `messages[].content[].content[]`, and a Responses tool output at
+  // `input[].output[]`. Walk the whole body so no container shape is missed.
+  const slots: Array<{ list: unknown[]; index: number; type: string }> = [];
+  const collect = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => {
+        if (!item || typeof item !== "object" || !("type" in item)) {
+          collect(item);
+          return;
+        }
+        if (typeof item.type !== "string" || !Object.hasOwn(IMAGE_BLOCK_TYPES, item.type)) {
+          collect(item);
+          return;
+        }
+        slots.push({ list: value, index, type: item.type });
       });
+      return;
     }
-  }
+    if (!value || typeof value !== "object") return;
+    for (const child of Object.values(value)) collect(child);
+  };
+  collect(parsed);
   const total = slots.length;
   const remove = Math.min(count, total - 1);
   if (remove <= 0) return null;
   for (const slot of slots.slice(total - remove)) {
     // A text stand-in keeps the surrounding message valid and says what happened.
-    slot.content[slot.index] = { type: slot.type === "input_image" ? "input_text" : "text", text: OMITTED_IMAGE_TEXT };
+    slot.list[slot.index] = { type: slot.type === "input_image" ? "input_text" : "text", text: OMITTED_IMAGE_TEXT };
   }
   return { body: JSON.stringify(parsed), removed: remove, total };
 }
