@@ -20,6 +20,7 @@ export type Options = {
   bigCtxConcurrency: number;
   mirrorLog: string | null;
   inspectSse: boolean;
+  dropImages: number;
 };
 
 const DEFAULT_OPTIONS: Options = {
@@ -38,6 +39,7 @@ const DEFAULT_OPTIONS: Options = {
   bigCtxConcurrency: 1,
   mirrorLog: null,
   inspectSse: true,
+  dropImages: 10,
 };
 
 const HELP = `AR-Proxy
@@ -60,6 +62,7 @@ Options:
   --big-ctx-tokens <n>        gate requests at this estimate  (default 60000, 0 disables)
   --big-ctx-concurrency <n>   concurrent large requests       (default 1)
   --mirror-log <path>         also append cc-switch-style log lines to this file
+  --drop-images <n>           newest images to drop on an image-cap 400 (default 10, 0 disables)
   --inspect-sse               inspect early HTTP 200 SSE errors (default on)
   --no-inspect-sse            forward HTTP 200 SSE without inspection
   -h, --help                  show this help
@@ -76,6 +79,7 @@ function validateOptions(opts: Options, allowEphemeralPort = false): void {
     ["--keepalive", opts.keepaliveMs, 0, 2_147_483_647],
     ["--big-ctx-tokens", opts.bigCtxTokens, 0, Number.MAX_SAFE_INTEGER],
     ["--big-ctx-concurrency", opts.bigCtxConcurrency, 1, Number.MAX_SAFE_INTEGER],
+    ["--drop-images", opts.dropImages, 0, Number.MAX_SAFE_INTEGER],
   ];
   for (const [flag, value, min, max] of integers) {
     if (!Number.isSafeInteger(value) || value < min || value > max) {
@@ -112,6 +116,7 @@ export function parseArgs(argv: string[]): Options {
     "--keepalive": (n) => (opts.keepaliveMs = n),
     "--big-ctx-tokens": (n) => (opts.bigCtxTokens = n),
     "--big-ctx-concurrency": (n) => (opts.bigCtxConcurrency = n),
+    "--drop-images": (n) => (opts.dropImages = n),
   };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
@@ -150,6 +155,11 @@ const STALE_REASONING_SIGNALS = [
   "different openai resource",
   "same resource that created the item",
 ];
+// Providers cap how many images one request may carry and reject the whole call
+// instead of trimming it. These phrases identify that specific rejection.
+const IMAGE_LIMIT_SIGNALS = ["maximum number of images", "too many images"];
+const IMAGE_BLOCK_TYPES: Record<string, true> = { input_image: true, image_url: true, image: true };
+const OMITTED_IMAGE_TEXT = "[image omitted by AR-Proxy: the request exceeded the provider's image limit]";
 // cc-switch uses these prefixes to carry Responses reasoning through Messages.
 const REASONING_SIGNATURE_PREFIXES = ["ccswitch-openai-reasoning-v1:", "ccswitch-openai-reasoning-"];
 const RATE_LIMIT_SIGNALS = [
@@ -399,6 +409,58 @@ function stripStaleReasoning(body: Uint8Array | undefined): StripResult | null {
   return { body: JSON.stringify(parsed), removedBlocks, removedSignatures };
 }
 
+type ImageTrim = { body: string; removed: number; total: number };
+
+/**
+ * Replace the newest image blocks with text so one request can fit the provider's
+ * image cap. Works on the Responses `input` shape and on the `messages` shape used
+ * by Chat Completions and Anthropic clients. Returns null when there is nothing to
+ * trim, including the case where dropping any image would drop the last one: the
+ * request's intent is what it is, and silently sending it without images would be
+ * worse than surfacing the provider's error.
+ */
+function dropTrailingImages(body: Uint8Array | undefined, count: number): ImageTrim | null {
+  if (!body || count <= 0) return null;
+  let parsed: { input?: unknown; messages?: unknown };
+  let lossless = true;
+  const rawJSON = (JSON as typeof JSON & { rawJSON?: (text: string) => unknown }).rawJSON;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body),
+      (_key, value, context?: { source?: string }) => {
+        if (typeof value !== "number") return value;
+        // Preserve numeric source tokens, including identifiers above 2^53.
+        if (rawJSON && context?.source) return rawJSON(context.source);
+        lossless = false;
+        return value;
+      });
+  } catch {
+    return null;
+  }
+  if (!lossless || !parsed || typeof parsed !== "object") return null;
+  const slots: Array<{ content: unknown[]; index: number; type: string }> = [];
+  for (const list of [parsed.input, parsed.messages]) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (!item || typeof item !== "object" || !("content" in item)) continue;
+      const content = item.content;
+      if (!Array.isArray(content)) continue;
+      content.forEach((block, index) => {
+        if (!block || typeof block !== "object" || !("type" in block)) return;
+        if (typeof block.type !== "string" || !Object.hasOwn(IMAGE_BLOCK_TYPES, block.type)) return;
+        slots.push({ content, index, type: block.type });
+      });
+    }
+  }
+  const total = slots.length;
+  const remove = Math.min(count, total - 1);
+  if (remove <= 0) return null;
+  for (const slot of slots.slice(total - remove)) {
+    // A text stand-in keeps the surrounding message valid and says what happened.
+    slot.content[slot.index] = { type: slot.type === "input_image" ? "input_text" : "text", text: OMITTED_IMAGE_TEXT };
+  }
+  return { body: JSON.stringify(parsed), removed: remove, total };
+}
+
 type Waiter = {
   resolve: (release: () => void) => void;
   reject: (reason: unknown) => void;
@@ -558,15 +620,21 @@ async function nextAttempt(state: RequestState): Promise<Attempt> {
     state.attempts++;
     try {
       const outcome = await attemptOnce(state);
-      if (outcome.kind === "ok" && outcome.response.status === 400 && !state.stripped && state.attempts < state.opts.maxAttempts) {
+      if (outcome.kind === "ok" && outcome.response.status === 400 && state.attempts < state.opts.maxAttempts) {
         const body = new Uint8Array(await outcome.response.arrayBuffer());
         const text = decoder.decode(body);
         const lowered = text.toLowerCase();
-        const stripped = STALE_REASONING_SIGNALS.some((signal) => lowered.includes(signal)) ? stripStaleReasoning(state.body) : null;
+        const stripped = !state.stripped && STALE_REASONING_SIGNALS.some((signal) => lowered.includes(signal)) ? stripStaleReasoning(state.body) : null;
         if (stripped && !state.retrySignal.aborted) {
           state.stripped = true;
           state.body = encoder.encode(stripped.body);
           state.log(`[${state.tag}] stale-reasoning 400: retrying once without ${stripped.removedBlocks} reasoning block(s) and ${stripped.removedSignatures} signature(s)`);
+          continue;
+        }
+        const trimmed = IMAGE_LIMIT_SIGNALS.some((signal) => lowered.includes(signal)) ? dropTrailingImages(state.body, state.opts.dropImages) : null;
+        if (trimmed && !state.retrySignal.aborted) {
+          state.body = encoder.encode(trimmed.body);
+          state.log(`[${state.tag}] image-cap 400: retrying without the newest ${trimmed.removed} of ${trimmed.total} image(s)`);
           continue;
         }
         return { kind: "ok", response: new Response(state.method === "HEAD" ? null : body, { status: 400, headers: copyHeaders(outcome.response.headers, state.method === "HEAD") }) };

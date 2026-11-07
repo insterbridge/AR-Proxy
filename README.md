@@ -353,6 +353,27 @@ source, including large integers and precise decimals. If the Bun runtime cannot
 preserve those values, recovery is skipped rather than changing them. Native
 Responses `input` items are **not** rewritten by this mechanism.
 
+### Image-cap recovery
+
+Providers cap how many images one request may carry — AgentRouter rejects the
+whole call with `400 Exceeded maximum number of images (50) allowed in the
+request` instead of trimming it. On a `400` carrying that phrase, the proxy
+replaces the newest `--drop-images` image blocks (default `10`) with a short
+text note and retries. If the provider still reports the cap, it drops another
+batch, bounded by `--max-attempts`.
+
+It recognizes `input_image` blocks in a Responses `input`, and `image` /
+`image_url` blocks in a `messages` array, so bridged Messages and Chat-Completions
+requests are trimmed the same way. The oldest images are kept and the most recent
+ones go first, on the assumption that the newest screenshots are the least
+important context. `--drop-images 0` disables the behavior.
+
+Two limits are deliberate: the last image is never dropped — a request that
+arrives with a single image is returned with the provider's error rather than
+silently stripped — and only the recognized image-cap error triggers trimming,
+so other `400`s pass through untouched. Numeric source tokens are preserved the
+same way as stale-reasoning recovery.
+
 ## Proxy options
 
 All numeric values must be integers. Time values are in milliseconds.
@@ -373,6 +394,7 @@ All numeric values must be integers. Time values are in milliseconds.
 | `--big-ctx-tokens` | `60000` | Gate threshold; `0` disables |
 | `--big-ctx-concurrency` | `1` | Large requests allowed at once |
 | `--mirror-log` | Unset | Additional log file; its parent directory must exist |
+| `--drop-images` | `10` | Newest images replaced on a recognized image-cap `400`; `0` disables |
 | `--inspect-sse` / `--no-inspect-sse` | Enabled | Early SSE error inspection |
 | `-h`, `--help` | — | Show command-line help |
 

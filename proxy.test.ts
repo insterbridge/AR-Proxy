@@ -210,6 +210,106 @@ describe("HTTP forwarding", () => {
   });
 });
 
+describe("image cap", () => {
+  const images = (n: number, type = "input_image") =>
+    Array.from({ length: n }, (_, i) => ({ type, ...(type === "input_image" ? { image_url: `data:image/png;base64,${i}` } : { image_url: { url: `data:image/png;base64,${i}` } }) }));
+  const responsesBody = (count: number) => ({
+    model: "probe-model",
+    input: [{ role: "user", content: [{ type: "input_text", text: "look" }, ...images(count)] }],
+  });
+  const chatBody = (count: number) => ({
+    model: "probe-model",
+    messages: [{ role: "user", content: [{ type: "text", text: "look" }, ...images(count, "image_url")] }],
+  });
+
+  function contentBlocks(body: unknown): unknown[] {
+    if (!body || typeof body !== "object") return [];
+    const blocks: unknown[] = [];
+    const lists = [
+      "input" in body ? body.input : undefined,
+      "messages" in body ? body.messages : undefined,
+    ];
+    for (const list of lists) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        if (!item || typeof item !== "object" || !("content" in item)) continue;
+        if (Array.isArray(item.content)) blocks.push(...item.content);
+      }
+    }
+    return blocks;
+  }
+
+  function imageUrls(body: unknown): string[] {
+    return contentBlocks(body).flatMap((block) => {
+      if (!block || typeof block !== "object" || !("type" in block)) return [];
+      if (block.type !== "input_image" && block.type !== "image_url") return [];
+      if (!("image_url" in block)) return [];
+      if (typeof block.image_url === "string") return [block.image_url];
+      if (block.image_url && typeof block.image_url === "object" && "url" in block.image_url && typeof block.image_url.url === "string") {
+        return [block.image_url.url];
+      }
+      return [];
+    });
+  }
+
+  test("drops the newest images and retries while the provider reports its cap", async () => {
+    const seen: string[][] = [];
+    const target = upstream(async (req) => {
+      const body: unknown = await req.json();
+      const urls = imageUrls(body);
+      seen.push(urls);
+      if (urls.length > 5) {
+        return Response.json({ error: { message: "Exceeded maximum number of images (5) allowed in the request." } }, { status: 400 });
+      }
+      return Response.json({ ok: true });
+    });
+    const server = proxy(target.url.toString(), { dropImages: 3, maxAttempts: 4 });
+    const response = await post(server, responsesBody(10), "/v1/responses");
+    expect(response.status).toBe(200);
+    expect(seen.map((urls) => urls.length)).toEqual([10, 7, 4]);
+    // The oldest images survive; only the newest were replaced.
+    expect(seen.at(-1)).toEqual(images(4).map((block) => block.image_url));
+  });
+
+  test("trims the messages shape used by Chat and Anthropic clients", async () => {
+    const target = upstream(async (req) => {
+      const body: unknown = await req.json();
+      if (imageUrls(body).length > 2) {
+        return Response.json({ error: { message: "Exceeded maximum number of images (2) allowed in the request." } }, { status: 400 });
+      }
+      return Response.json({ ok: true });
+    });
+    const server = proxy(target.url.toString(), { dropImages: 2, maxAttempts: 4 });
+    const response = await post(server, chatBody(5), "/v1/chat/completions");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+  });
+
+  test("passes the provider error through instead of dropping the last image", async () => {
+    let calls = 0;
+    const target = upstream(() => {
+      calls++;
+      return Response.json({ error: { message: "Exceeded maximum number of images (50) allowed in the request." } }, { status: 400 });
+    });
+    const server = proxy(target.url.toString(), { dropImages: 10 });
+    const response = await post(server, responsesBody(1), "/v1/responses");
+    expect(response.status).toBe(400);
+    expect(calls).toBe(1);
+  });
+
+  test("leaves the request untouched when dropping is disabled", async () => {
+    let calls = 0;
+    const target = upstream(() => {
+      calls++;
+      return Response.json({ error: { message: "Exceeded maximum number of images (5) allowed in the request." } }, { status: 400 });
+    });
+    const server = proxy(target.url.toString(), { dropImages: 0 });
+    const response = await post(server, responsesBody(10), "/v1/responses");
+    expect(response.status).toBe(400);
+    expect(calls).toBe(1);
+  });
+});
+
 describe("retry policy", () => {
   test.each(["flaky422", "flakybefore", "flakyconn"])("recovers from %s", async (mode) => {
     const fixture = probe(mode);
